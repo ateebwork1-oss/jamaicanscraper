@@ -7,19 +7,18 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
  * Output: deduped list of LinkedIn profile URLs.
  *
  * Provider chain (first one that returns URLs wins):
- *   1. DuckDuckGo HTML endpoint (POST html.duckduckgo.com/html/)
- *   2. DuckDuckGo Lite endpoint (GET lite.duckduckgo.com/lite/)
- *   3. Brave Search API           (only if BRAVE_API_KEY env var is set)
- *
- * DDG frequently 403s datacenter IPs. Brave is the reliable fallback;
- * it has a free 2,000-query/month tier at https://brave.com/search/api/.
+ *   1. Google Custom Search API (needs GOOGLE_API_KEY + GOOGLE_CSE_ID)
+ *      -> 100 queries/day free, no CC required, bulletproof from Vercel
+ *   2. Bing HTML scrape (no key needed, usually works from datacenter IPs)
+ *   3. DuckDuckGo html endpoint (often blocked from Vercel, worth trying)
+ *   4. DuckDuckGo Lite endpoint (last resort)
  *
  * Auth: header `x-api-key` OR query `?key=` must equal SCRAPER_SHARED_SECRET.
  */
 
 const MAX_LIMIT = 200;
-const MAX_PAGES = 4;
-const PAGE_SIZE = 50;
+const DDG_MAX_PAGES = 3;
+const DDG_PAGE_SIZE = 50;
 const POLITE_DELAY_MS = 600;
 
 const BROWSER_HEADERS = {
@@ -54,6 +53,7 @@ interface ProviderResult {
   ok: boolean;
   urls: string[];
   error?: string;
+  meta?: Record<string, unknown>;
 }
 
 function readInput(req: VercelRequest): SearchInput {
@@ -120,20 +120,14 @@ function extractDirectLinkedInUrls(html: string): string[] {
   return out;
 }
 
-/**
- * DDG html endpoint wraps result URLs in a redirect like
- *   //duckduckgo.com/l/?uddg=ENCODED_REAL_URL&...
- * Extract and decode those.
- */
 function extractDDGRedirectedUrls(html: string): string[] {
   const re = /\/l\/\?[^"'>\s]*uddg=([^"'&>\s]+)/gi;
   const seen = new Set<string>();
   const out: string[] = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
-    const encoded = m[1];
     try {
-      const decoded = decodeURIComponent(encoded);
+      const decoded = decodeURIComponent(m[1]);
       const norm = normalizeUrl(decoded);
       if (!norm) continue;
       const key = norm.toLowerCase();
@@ -147,17 +141,187 @@ function extractDDGRedirectedUrls(html: string): string[] {
   return out;
 }
 
+function extractBingRedirectedUrls(html: string): string[] {
+  // Bing wraps results in /ck/a?!&&p=...&u=a1aHR0cHM... with base64-encoded URLs.
+  // BUT it also leaves raw <cite> tags with the real URL visible as text. Easier
+  // to just match the direct URLs either in href attributes or cite elements.
+  // The extractDirectLinkedInUrls handles these, plus we do a secondary pass on
+  // <cite> text.
+  const citeRe = /<cite[^>]*>([^<]+)<\/cite>/gi;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = citeRe.exec(html)) !== null) {
+    const txt = m[1].replace(/\s/g, "").replace(/\u203a/g, "/"); // strip " › "
+    const candidates = extractDirectLinkedInUrls(txt);
+    for (const c of candidates) {
+      const key = c.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(c);
+    }
+  }
+  return out;
+}
+
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// ---------- Provider: Google Custom Search API (best if configured) ----------
+async function fetchGoogleCSE(
+  query: string,
+  limit: number,
+): Promise<ProviderResult> {
+  const apiKey = process.env.GOOGLE_API_KEY;
+  const cseId = process.env.GOOGLE_CSE_ID;
+  if (!apiKey || !cseId) {
+    return {
+      provider: "google-cse",
+      ok: false,
+      urls: [],
+      error: "GOOGLE_API_KEY and/or GOOGLE_CSE_ID not set",
+    };
+  }
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  const pagesToFetch = Math.min(Math.ceil(limit / 10), 10); // CSE max 100 results
+
+  try {
+    for (let p = 0; p < pagesToFetch; p++) {
+      const start = p * 10 + 1;
+      const params = new URLSearchParams({
+        key: apiKey,
+        cx: cseId,
+        q: query,
+        num: "10",
+        start: String(start),
+      });
+      const resp = await fetch(
+        `https://www.googleapis.com/customsearch/v1?${params.toString()}`,
+      );
+      if (!resp.ok) {
+        return {
+          provider: "google-cse",
+          httpStatus: resp.status,
+          ok: urls.length > 0,
+          urls,
+          error: `google-cse HTTP ${resp.status}`,
+        };
+      }
+      const data: any = await resp.json();
+      const items: any[] = data?.items || [];
+      if (items.length === 0) break;
+      let newCount = 0;
+      for (const it of items) {
+        const norm = normalizeUrl(String(it?.link || ""));
+        if (!norm) continue;
+        const key = norm.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        urls.push(norm);
+        newCount++;
+      }
+      if (newCount === 0) break;
+      if (urls.length >= limit) break;
+    }
+    return {
+      provider: "google-cse",
+      ok: urls.length > 0,
+      urls,
+    };
+  } catch (err: any) {
+    return {
+      provider: "google-cse",
+      ok: false,
+      urls,
+      error: err?.message || String(err),
+    };
+  }
+}
+
+// ---------- Provider: Bing HTML scrape ----------
+async function fetchBing(
+  query: string,
+  limit: number,
+): Promise<ProviderResult> {
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  let lastStatus: number | undefined;
+  const pages = Math.min(Math.ceil(limit / 10), 5);
+
+  try {
+    for (let p = 0; p < pages; p++) {
+      const first = p * 10 + 1;
+      const params = new URLSearchParams({
+        q: query,
+        first: String(first),
+        count: "10",
+        setLang: "en-US",
+        cc: "US",
+      });
+      const resp = await fetch(
+        `https://www.bing.com/search?${params.toString()}`,
+        {
+          method: "GET",
+          headers: {
+            ...BROWSER_HEADERS,
+            Referer: "https://www.bing.com/",
+          },
+        },
+      );
+      lastStatus = resp.status;
+      if (!resp.ok) {
+        return {
+          provider: "bing",
+          httpStatus: resp.status,
+          ok: urls.length > 0,
+          urls,
+          error: `bing HTTP ${resp.status}`,
+        };
+      }
+      const html = await resp.text();
+      const direct = extractDirectLinkedInUrls(html);
+      const cites = extractBingRedirectedUrls(html);
+      const pageUrls = [...direct, ...cites];
+
+      let newCount = 0;
+      for (const u of pageUrls) {
+        const key = u.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        urls.push(u);
+        newCount++;
+      }
+      if (newCount === 0) break;
+      if (urls.length >= limit) break;
+      if (p < pages - 1) await sleep(POLITE_DELAY_MS);
+    }
+    return {
+      provider: "bing",
+      httpStatus: lastStatus,
+      ok: urls.length > 0,
+      urls,
+    };
+  } catch (err: any) {
+    return {
+      provider: "bing",
+      httpStatus: lastStatus,
+      ok: false,
+      urls,
+      error: err?.message || String(err),
+    };
+  }
+}
+
+// ---------- Provider: DDG html ----------
 async function fetchDDGHtml(query: string): Promise<ProviderResult> {
   const urls: string[] = [];
   const seen = new Set<string>();
   let lastStatus: number | undefined;
 
   try {
-    for (let page = 0; page < MAX_PAGES; page++) {
+    for (let page = 0; page < DDG_MAX_PAGES; page++) {
       const form = new URLSearchParams();
       form.set("q", query);
       form.set("kl", "us-en");
@@ -178,16 +342,16 @@ async function fetchDDGHtml(query: string): Promise<ProviderResult> {
         return {
           provider: "ddg-html",
           httpStatus: resp.status,
-          ok: false,
+          ok: urls.length > 0,
           urls,
           error: `ddg-html HTTP ${resp.status}`,
         };
       }
       const html = await resp.text();
-      const direct = extractDirectLinkedInUrls(html);
-      const redirected = extractDDGRedirectedUrls(html);
-      const pageUrls = [...direct, ...redirected];
-
+      const pageUrls = [
+        ...extractDirectLinkedInUrls(html),
+        ...extractDDGRedirectedUrls(html),
+      ];
       let newCount = 0;
       for (const u of pageUrls) {
         const key = u.toLowerCase();
@@ -197,9 +361,14 @@ async function fetchDDGHtml(query: string): Promise<ProviderResult> {
         newCount++;
       }
       if (newCount === 0) break;
-      if (page < MAX_PAGES - 1) await sleep(POLITE_DELAY_MS);
+      if (page < DDG_MAX_PAGES - 1) await sleep(POLITE_DELAY_MS);
     }
-    return { provider: "ddg-html", httpStatus: lastStatus, ok: urls.length > 0, urls };
+    return {
+      provider: "ddg-html",
+      httpStatus: lastStatus,
+      ok: urls.length > 0,
+      urls,
+    };
   } catch (err: any) {
     return {
       provider: "ddg-html",
@@ -211,20 +380,24 @@ async function fetchDDGHtml(query: string): Promise<ProviderResult> {
   }
 }
 
+// ---------- Provider: DDG lite ----------
 async function fetchDDGLite(query: string): Promise<ProviderResult> {
   const urls: string[] = [];
   const seen = new Set<string>();
   let lastStatus: number | undefined;
 
   try {
-    for (let page = 0; page < MAX_PAGES; page++) {
+    for (let page = 0; page < DDG_MAX_PAGES; page++) {
       const params = new URLSearchParams({ q: query });
-      if (page > 0) params.set("s", String(page * PAGE_SIZE));
+      if (page > 0) params.set("s", String(page * DDG_PAGE_SIZE));
       const resp = await fetch(
         `https://lite.duckduckgo.com/lite/?${params.toString()}`,
         {
           method: "GET",
-          headers: { ...BROWSER_HEADERS, Referer: "https://lite.duckduckgo.com/" },
+          headers: {
+            ...BROWSER_HEADERS,
+            Referer: "https://lite.duckduckgo.com/",
+          },
         },
       );
       lastStatus = resp.status;
@@ -232,14 +405,13 @@ async function fetchDDGLite(query: string): Promise<ProviderResult> {
         return {
           provider: "ddg-lite",
           httpStatus: resp.status,
-          ok: false,
+          ok: urls.length > 0,
           urls,
           error: `ddg-lite HTTP ${resp.status}`,
         };
       }
       const html = await resp.text();
       const pageUrls = extractDirectLinkedInUrls(html);
-
       let newCount = 0;
       for (const u of pageUrls) {
         const key = u.toLowerCase();
@@ -249,9 +421,14 @@ async function fetchDDGLite(query: string): Promise<ProviderResult> {
         newCount++;
       }
       if (newCount === 0) break;
-      if (page < MAX_PAGES - 1) await sleep(POLITE_DELAY_MS);
+      if (page < DDG_MAX_PAGES - 1) await sleep(POLITE_DELAY_MS);
     }
-    return { provider: "ddg-lite", httpStatus: lastStatus, ok: urls.length > 0, urls };
+    return {
+      provider: "ddg-lite",
+      httpStatus: lastStatus,
+      ok: urls.length > 0,
+      urls,
+    };
   } catch (err: any) {
     return {
       provider: "ddg-lite",
@@ -263,74 +440,7 @@ async function fetchDDGLite(query: string): Promise<ProviderResult> {
   }
 }
 
-async function fetchBrave(query: string): Promise<ProviderResult> {
-  const apiKey = process.env.BRAVE_API_KEY;
-  if (!apiKey) {
-    return {
-      provider: "brave",
-      ok: false,
-      urls: [],
-      error: "BRAVE_API_KEY not set",
-    };
-  }
-  const urls: string[] = [];
-  const seen = new Set<string>();
-  try {
-    // Brave API: up to 20 results per request; paginate via `offset` (0-9)
-    for (let page = 0; page < 3; page++) {
-      const params = new URLSearchParams({
-        q: query,
-        count: "20",
-        offset: String(page),
-        result_filter: "web",
-      });
-      const resp = await fetch(
-        `https://api.search.brave.com/res/v1/web/search?${params.toString()}`,
-        {
-          method: "GET",
-          headers: {
-            "X-Subscription-Token": apiKey,
-            Accept: "application/json",
-            "Accept-Encoding": "gzip",
-          },
-        },
-      );
-      if (!resp.ok) {
-        return {
-          provider: "brave",
-          httpStatus: resp.status,
-          ok: urls.length > 0,
-          urls,
-          error: `brave HTTP ${resp.status}`,
-        };
-      }
-      const data: any = await resp.json();
-      const results = (data?.web?.results as any[]) || [];
-      let newCount = 0;
-      for (const r of results) {
-        const norm = normalizeUrl(String(r?.url || ""));
-        if (!norm) continue;
-        const key = norm.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-        urls.push(norm);
-        newCount++;
-      }
-      if (newCount === 0) break;
-      // Brave free tier: 1 req/sec
-      await sleep(1100);
-    }
-    return { provider: "brave", ok: urls.length > 0, urls };
-  } catch (err: any) {
-    return {
-      provider: "brave",
-      ok: false,
-      urls,
-      error: err?.message || String(err),
-    };
-  }
-}
-
+// ---------- Handler ----------
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const secret = process.env.SCRAPER_SHARED_SECRET;
   const providedSecret =
@@ -356,11 +466,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const query = buildDorkQuery(input);
   const attempts: ProviderResult[] = [];
 
-  // Provider chain: DDG html → DDG lite → Brave
   const providers: Array<() => Promise<ProviderResult>> = [
+    () => fetchGoogleCSE(query, input.limit),
+    () => fetchBing(query, input.limit),
     () => fetchDDGHtml(query),
     () => fetchDDGLite(query),
-    () => fetchBrave(query),
   ];
 
   let winner: ProviderResult | null = null;
@@ -379,7 +489,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       query,
       input,
       error:
-        "All providers failed to return LinkedIn URLs. See debug.attempts for per-provider status. If DDG keeps returning 403, set BRAVE_API_KEY in Vercel env vars (free tier: https://brave.com/search/api/).",
+        "All search providers failed. See debug.attempts[] for per-provider status. The most reliable free option is Google Custom Search API: create a CSE at https://programmablesearchengine.google.com, get an API key at https://console.cloud.google.com (enable 'Custom Search API'), then set GOOGLE_API_KEY and GOOGLE_CSE_ID env vars in Vercel.",
       debug: { attempts },
     });
   }
