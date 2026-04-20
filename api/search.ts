@@ -6,14 +6,20 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
  * Input:  { country, title, industry, extraTerms, limit }
  * Output: deduped list of LinkedIn profile URLs.
  *
- * Provider chain (first one that returns URLs wins):
- *   1. Serper.dev Google SERP API (needs SERPER_API_KEY)
- *      -> 2,500 free queries on signup, no CC, works instantly
- *   2. Google Custom Search API (needs GOOGLE_API_KEY + GOOGLE_CSE_ID)
- *      -> 100 queries/day free, no CC required
- *   3. Bing HTML scrape (no key; often Cloudflare-CAPTCHA'd from datacenter IPs)
- *   4. DuckDuckGo html endpoint (often 403 from Vercel)
- *   5. DuckDuckGo Lite endpoint (last resort)
+ * Provider chain (first one that returns URLs wins).
+ * You only need ONE keyed provider configured; the rest are fallbacks.
+ *
+ *   1. Serper.dev Google SERP API (SERPER_API_KEY)
+ *      -> 2,500 free queries on signup, no CC
+ *   2. SerpApi (SERPAPI_KEY)
+ *      -> 100 free queries/month, no CC
+ *   3. ScrapingDog Google SERP (SCRAPINGDOG_API_KEY)
+ *      -> 1,000 free credits, no CC
+ *   4. Google Custom Search API (GOOGLE_API_KEY + GOOGLE_CSE_ID)
+ *      -> 100 queries/day free, no CC
+ *   5. Bing HTML scrape (keyless; Cloudflare-CAPTCHA'd from datacenter IPs)
+ *   6. DuckDuckGo html (keyless; usually 403 from Vercel)
+ *   7. DuckDuckGo Lite (keyless; usually 403 from Vercel)
  *
  * Auth: header `x-api-key` OR query `?key=` must equal SCRAPER_SHARED_SECRET.
  */
@@ -238,6 +244,163 @@ async function fetchSerper(
   } catch (err: any) {
     return {
       provider: "serper",
+      httpStatus: lastStatus,
+      ok: false,
+      urls,
+      error: err?.message || String(err),
+    };
+  }
+}
+
+// ---------- Provider: SerpApi (Google SERP via serpapi.com) ----------
+async function fetchSerpApi(
+  query: string,
+  limit: number,
+): Promise<ProviderResult> {
+  const apiKey = process.env.SERPAPI_KEY;
+  if (!apiKey) {
+    return {
+      provider: "serpapi",
+      ok: false,
+      urls: [],
+      error: "SERPAPI_KEY not set",
+    };
+  }
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  let lastStatus: number | undefined;
+  // SerpApi returns up to 100 per call via num; paginate via start offset.
+  const perPage = 100;
+  const pagesToFetch = Math.min(Math.ceil(limit / perPage), 3);
+
+  try {
+    for (let p = 0; p < pagesToFetch; p++) {
+      const params = new URLSearchParams({
+        engine: "google",
+        q: query,
+        num: String(perPage),
+        start: String(p * perPage),
+        api_key: apiKey,
+        hl: "en",
+        gl: "us",
+      });
+      const resp = await fetch(
+        `https://serpapi.com/search.json?${params.toString()}`,
+      );
+      lastStatus = resp.status;
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => "");
+        return {
+          provider: "serpapi",
+          httpStatus: resp.status,
+          ok: urls.length > 0,
+          urls,
+          error: `serpapi HTTP ${resp.status} ${errText.slice(0, 200)}`,
+        };
+      }
+      const data: any = await resp.json();
+      const organic: any[] = data?.organic_results || [];
+      if (organic.length === 0) break;
+      let newCount = 0;
+      for (const it of organic) {
+        const norm = normalizeUrl(String(it?.link || ""));
+        if (!norm) continue;
+        const key = norm.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        urls.push(norm);
+        newCount++;
+      }
+      if (newCount === 0) break;
+      if (urls.length >= limit) break;
+    }
+    return {
+      provider: "serpapi",
+      httpStatus: lastStatus,
+      ok: urls.length > 0,
+      urls,
+    };
+  } catch (err: any) {
+    return {
+      provider: "serpapi",
+      httpStatus: lastStatus,
+      ok: false,
+      urls,
+      error: err?.message || String(err),
+    };
+  }
+}
+
+// ---------- Provider: ScrapingDog Google SERP ----------
+async function fetchScrapingDog(
+  query: string,
+  limit: number,
+): Promise<ProviderResult> {
+  const apiKey = process.env.SCRAPINGDOG_API_KEY;
+  if (!apiKey) {
+    return {
+      provider: "scrapingdog",
+      ok: false,
+      urls: [],
+      error: "SCRAPINGDOG_API_KEY not set",
+    };
+  }
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  let lastStatus: number | undefined;
+  // ScrapingDog Google SERP returns up to ~100 per call via results param.
+  const perPage = 100;
+  const pagesToFetch = Math.min(Math.ceil(limit / perPage), 3);
+
+  try {
+    for (let p = 0; p < pagesToFetch; p++) {
+      const params = new URLSearchParams({
+        api_key: apiKey,
+        query,
+        results: String(perPage),
+        page: String(p),
+        country: "us",
+      });
+      const resp = await fetch(
+        `https://api.scrapingdog.com/google?${params.toString()}`,
+      );
+      lastStatus = resp.status;
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => "");
+        return {
+          provider: "scrapingdog",
+          httpStatus: resp.status,
+          ok: urls.length > 0,
+          urls,
+          error: `scrapingdog HTTP ${resp.status} ${errText.slice(0, 200)}`,
+        };
+      }
+      const data: any = await resp.json();
+      const organic: any[] =
+        data?.organic_results || data?.organic_data || [];
+      if (organic.length === 0) break;
+      let newCount = 0;
+      for (const it of organic) {
+        const norm = normalizeUrl(String(it?.link || it?.url || ""));
+        if (!norm) continue;
+        const key = norm.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        urls.push(norm);
+        newCount++;
+      }
+      if (newCount === 0) break;
+      if (urls.length >= limit) break;
+    }
+    return {
+      provider: "scrapingdog",
+      httpStatus: lastStatus,
+      ok: urls.length > 0,
+      urls,
+    };
+  } catch (err: any) {
+    return {
+      provider: "scrapingdog",
       httpStatus: lastStatus,
       ok: false,
       urls,
@@ -546,6 +709,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const providers: Array<() => Promise<ProviderResult>> = [
     () => fetchSerper(query, input.limit),
+    () => fetchSerpApi(query, input.limit),
+    () => fetchScrapingDog(query, input.limit),
     () => fetchGoogleCSE(query, input.limit),
     () => fetchBing(query, input.limit),
     () => fetchDDGHtml(query),
@@ -568,7 +733,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       query,
       input,
       error:
-        "All search providers failed. See debug.attempts[] for per-provider status. Quickest fix: sign up at https://serper.dev (free 2,500 queries, no credit card), paste the API key as SERPER_API_KEY in Vercel env vars, redeploy.",
+        "All search providers failed. See debug.attempts[] for per-provider status. Sign up for ONE of these (all free, no CC) and paste the key into Vercel env vars: serper.dev -> SERPER_API_KEY, serpapi.com -> SERPAPI_KEY, scrapingdog.com -> SCRAPINGDOG_API_KEY.",
       debug: { attempts },
     });
   }

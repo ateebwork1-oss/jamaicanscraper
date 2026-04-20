@@ -6,17 +6,19 @@ Designed as the **Caribbean-only branch** of an n8n workflow whose main Apify pi
 
 ## Provider chain
 
-The function tries these providers in order until one returns URLs:
+The function tries these providers in order until one returns URLs. **You only need ONE of the keyed providers configured** — whichever signup you can actually complete.
 
-| # | Provider | Setup | Free quota | Works from Vercel? |
+| # | Provider | Env vars | Free quota | Signup |
 |---|---|---|---|---|
-| 1 | **Serper.dev** (Google SERP API) | `SERPER_API_KEY` | 2,500 queries on signup, no CC | ✅ Reliable |
-| 2 | **Google Custom Search** | `GOOGLE_API_KEY` + `GOOGLE_CSE_ID` | 100/day, no CC | ✅ when configured right |
-| 3 | Bing HTML scrape | none | unlimited | ⚠️ Cloudflare CAPTCHA on datacenter IPs |
-| 4 | DuckDuckGo html | none | unlimited | ⚠️ Usually 403s from Vercel |
-| 5 | DuckDuckGo Lite | none | unlimited | ⚠️ Usually 403s from Vercel |
+| 1 | **Serper.dev** | `SERPER_API_KEY` | 2,500 queries, no CC | https://serper.dev |
+| 2 | **SerpApi** | `SERPAPI_KEY` | 100/month, no CC | https://serpapi.com/users/sign_up |
+| 3 | **ScrapingDog** | `SCRAPINGDOG_API_KEY` | 1,000 credits, no CC | https://www.scrapingdog.com |
+| 4 | **Google Custom Search** | `GOOGLE_API_KEY` + `GOOGLE_CSE_ID` | 100/day, no CC | programmablesearchengine.google.com + console.cloud.google.com |
+| 5 | Bing HTML scrape | none | unlimited | ⚠️ Cloudflare CAPTCHAs datacenter IPs |
+| 6 | DuckDuckGo html | none | unlimited | ⚠️ Usually 403 from Vercel |
+| 7 | DuckDuckGo Lite | none | unlimited | ⚠️ Usually 403 from Vercel |
 
-**Recommended**: set `SERPER_API_KEY` and ignore the rest. The unkeyed scrapers mostly exist as a historical fallback and will almost always fail from a Vercel IP.
+Providers 5–7 exist as historical fallback and will almost always fail from a Vercel IP. You really do need one of 1–4.
 
 ## Endpoint
 
