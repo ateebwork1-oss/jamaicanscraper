@@ -194,12 +194,13 @@ async function fetchSerper(
   const seen = new Set<string>();
   let lastStatus: number | undefined;
 
-  // Serper returns up to 100 results per call via `num`. Paginate with `page`.
-  const perPage = 100;
-  const pagesToFetch = Math.min(Math.ceil(limit / perPage), 3);
+  // Google caps at ~10 results per page, so paginate with `page=1,2,3...`.
+  // Google's pagination effectively dies past ~10 pages (100 results).
+  const perPage = 10;
+  const maxPages = Math.min(Math.ceil(limit / perPage), 10);
 
   try {
-    for (let page = 1; page <= pagesToFetch; page++) {
+    for (let page = 1; page <= maxPages; page++) {
       const resp = await fetch("https://google.serper.dev/search", {
         method: "POST",
         headers: {
@@ -269,12 +270,13 @@ async function fetchSerpApi(
   const urls: string[] = [];
   const seen = new Set<string>();
   let lastStatus: number | undefined;
-  // SerpApi returns up to 100 per call via num; paginate via start offset.
-  const perPage = 100;
-  const pagesToFetch = Math.min(Math.ceil(limit / perPage), 3);
+  // Google only returns ~10 per page since the `num` param was deprecated in
+  // late 2024. Paginate via `start` offset 0, 10, 20 ... up to ~100 results.
+  const perPage = 10;
+  const maxPages = Math.min(Math.ceil(limit / perPage), 10);
 
   try {
-    for (let p = 0; p < pagesToFetch; p++) {
+    for (let p = 0; p < maxPages; p++) {
       const params = new URLSearchParams({
         engine: "google",
         q: query,
@@ -348,12 +350,12 @@ async function fetchScrapingDog(
   const urls: string[] = [];
   const seen = new Set<string>();
   let lastStatus: number | undefined;
-  // ScrapingDog Google SERP returns up to ~100 per call via results param.
-  const perPage = 100;
-  const pagesToFetch = Math.min(Math.ceil(limit / perPage), 3);
+  // Google caps at ~10 per page; paginate `page=0,1,2...` up to ~100 results.
+  const perPage = 10;
+  const maxPages = Math.min(Math.ceil(limit / perPage), 10);
 
   try {
-    for (let p = 0; p < pagesToFetch; p++) {
+    for (let p = 0; p < maxPages; p++) {
       const params = new URLSearchParams({
         api_key: apiKey,
         query,
