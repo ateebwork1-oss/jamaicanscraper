@@ -1,134 +1,117 @@
-# LinkedIn Profile Scraper on Vercel
+# Caribbean LinkedIn URL discovery (Vercel)
 
-Serverless port of [`josephlimtech/linkedin-profile-scraper-api`](https://github.com/josephlimtech/linkedin-profile-scraper-api) (MIT) — original by Joseph Lim — rewritten to run as a Vercel Function using `puppeteer-core` + `@sparticuz/chromium` instead of full `puppeteer`.
+Given a search query like `{ country: "Jamaica", title: "CEO" }`, this endpoint returns a list of public LinkedIn profile URLs by scraping DuckDuckGo Lite search results for the dork `site:linkedin.com/in/ "Jamaica" "CEO"`.
 
-**Input:** `?url=<linkedin profile URL>` plus auth
-**Output:** JSON with `userProfile`, `experiences`, `education`, `skills`
+Designed as the **Caribbean-only branch** of an n8n workflow whose main Apify pipeline works everywhere else.
 
-## Hard limits you need to know before deploying
+**Why DDG and not SerpAPI / Google / LinkedIn search?**
 
-1. **Cold starts are slow.** First request after inactivity: ~5–10 s just to boot Chromium.
-2. **60 s function timeout** on Vercel Pro. If a profile page is slow to load, requests will die. Hobby plan's 10 s cap is useless for this.
-3. **LinkedIn blocks Vercel IPs.** Vercel's egress is datacenter IPs that LinkedIn's bot-detection knows about. Your `li_at` session cookie will start throwing auth challenges much faster than it would from a residential IP. Expect to cycle cookies / accounts. Don't use your primary LinkedIn account.
-4. **The DOM selectors in this scraper are from LinkedIn's 2020 layout.** LinkedIn has redesigned profile pages multiple times. Most fields will come back `null` until you update the selectors in `lib/scraper.ts` to match the current DOM. Open a profile in DevTools, inspect, update.
-5. **No `keepAlive`.** Serverless containers are ephemeral, so every request does a full Chromium launch + LinkedIn auth + scrape + teardown. There's no persistent session to reuse.
+- Free, no API key, no billing
+- Doesn't CAPTCHA Vercel's datacenter IPs the way Google does
+- No LinkedIn cookie, so your `li_at` can never get burned
+- Cold starts < 1 s (no Puppeteer, no Chromium)
 
-You were warned. Now:
+## Endpoint
 
-## Deploy
+### `GET /api/search`
 
-### 1. Get your LinkedIn session cookie (`li_at`)
+| Query param | Type | Required | Notes |
+|---|---|---|---|
+| `country` | string | one of | e.g. `Jamaica`, `Trinidad and Tobago` |
+| `title` | string | one of | e.g. `CEO`, `Marketing Director` |
+| `industry` | string | one of | e.g. `Hospitality`, `Banking` |
+| `extraTerms` | string | one of | raw additional dork terms |
+| `limit` | number | no | default 50, max 200 |
+| `key` | string | **required** | must equal `SCRAPER_SHARED_SECRET` env var |
 
-- Log in to LinkedIn in a browser **with a burner account** (not your real one — this account will get rate-limited or banned eventually)
-- Open DevTools → Application → Cookies → `https://www.linkedin.com`
-- Copy the value of the `li_at` cookie
+At least one of `country / title / industry / extraTerms` is required.
 
-### 2. Deploy to Vercel
-
-```bash
-cd linkedin-scraper-vercel
-
-# install Vercel CLI if you haven't
-npm i -g vercel
-
-# install deps locally once so vercel has package-lock.json
-npm install
-
-# login + link project
-vercel login
-vercel link    # creates a new project, or links to existing
-
-# set the required env vars in Vercel
-vercel env add LINKEDIN_SESSION_COOKIE_VALUE production
-# (paste the li_at value when prompted)
-
-vercel env add SCRAPER_SHARED_SECRET production
-# (paste a long random string; this is your API key for calls to /api/scrape)
-
-# ship it
-vercel --prod
-```
-
-After `vercel --prod`, you'll get a URL like `https://linkedin-scraper-vercel-<hash>.vercel.app`. That's your API endpoint.
-
-### 3. Test it
-
-```bash
-curl "https://YOUR-DEPLOYMENT.vercel.app/api/scrape?url=https://www.linkedin.com/in/williamhgates/&key=YOUR_SCRAPER_SHARED_SECRET"
-```
-
-Expected shape on success:
+### Response (200)
 
 ```json
 {
   "ok": true,
-  "data": {
-    "userProfile": { "fullName": "...", "title": "...", "location": {...}, "url": "..." },
-    "experiences": [...],
-    "education": [...],
-    "skills": [...]
-  }
+  "query": "site:linkedin.com/in/ \"Jamaica\" \"CEO\"",
+  "input": { "country": "Jamaica", "title": "CEO", "industry": "", "extraTerms": "", "limit": 50 },
+  "count": 34,
+  "urls": [
+    { "url": "https://www.linkedin.com/in/jane-doe-abc123", "linkedin": "https://www.linkedin.com/in/jane-doe-abc123" },
+    { "url": "https://jm.linkedin.com/in/john-smith",       "linkedin": "https://jm.linkedin.com/in/john-smith" }
+  ],
+  "debug": { "pages": [ { "page": 0, "offset": 0, "newUrls": 18 }, { "page": 1, "offset": 50, "newUrls": 16 } ] }
 }
 ```
 
-If you get `{ "ok": false, "name": "SessionExpired", ... }` — your `li_at` cookie is dead. Get a new one and `vercel env add` again, then redeploy.
+### Errors
 
-If fields come back `null` but there's no error — the scraper ran, but LinkedIn's DOM has changed since the selectors in `lib/scraper.ts` were written. Inspect the profile page and update the selectors.
+| HTTP | Meaning |
+|---|---|
+| 400 | No search terms provided |
+| 401 | Bad or missing `key` / `x-api-key` |
+| 500 | `SCRAPER_SHARED_SECRET` not configured on Vercel |
+| 502 | DDG returned non-200 or failed mid-pagination (partial count in body) |
 
-## Request API
+## Deploy
 
-### `GET /api/scrape`
+### 1. Vercel env vars
 
-**Query string:**
-- `url` (required) — LinkedIn profile URL
-- `key` (required unless passed as header) — value of `SCRAPER_SHARED_SECRET`
+In your Vercel project settings → Environment Variables:
 
-### `POST /api/scrape`
+- `SCRAPER_SHARED_SECRET` = long random string (e.g. `openssl rand -hex 32`)
 
-**Headers:**
-- `x-api-key: <SCRAPER_SHARED_SECRET>` — auth
-- `x-linkedin-cookie: <li_at_value>` — optional override of the env-var cookie, useful for rotating accounts
+That's the only env var you need. No LinkedIn cookie, no API keys.
 
-**Body (JSON):**
-```json
-{ "url": "https://www.linkedin.com/in/handle/", "sessionCookieValue": "optional_override" }
+### 2. Deploy
+
+If you've already connected the GitHub repo to Vercel (which you have — `ateebwork1-oss/jamaicanscraper`), a `git push` to `main` auto-redeploys. Otherwise:
+
+```bash
+npm install
+vercel --prod
 ```
 
-### Responses
+### 3. Test
 
-| Code | Meaning |
-|---|---|
-| 200 | `{ ok: true, data: {...} }` |
-| 400 | Missing `url` |
-| 401 | Bad `SCRAPER_SHARED_SECRET` or expired LinkedIn session |
-| 500 | Anything else — message in `error` |
+```bash
+curl "https://<your-vercel-url>/api/search?country=Jamaica&title=CEO&limit=20&key=YOUR_SHARED_SECRET"
+```
+
+Expected: `ok: true` with a `urls` array of ~15–20 LinkedIn profile URLs.
 
 ## Calling it from n8n
 
-See the companion workflow `LinkedIn Leads Scraper.v2.json` in the parent folder. The **Enrich via Vercel** Code node calls this endpoint per lead using `$helpers.httpRequest`, paced at ~1.5 s between calls. Before importing into n8n, replace these two placeholders in that node:
+The companion workflow `LinkedIn Leads Scraper.v3.json` (in the parent folder) does this:
 
-- `YOUR_VERCEL_DEPLOYMENT.vercel.app` — your actual Vercel URL
-- `YOUR_VERCEL_SHARED_SECRET` — your `SCRAPER_SHARED_SECRET`
-
-## Local dev
-
-```bash
-cp .env.example .env
-# fill in LINKEDIN_SESSION_COOKIE_VALUE and SCRAPER_SHARED_SECRET
-npm install
-vercel dev
-# then: curl "http://localhost:3000/api/scrape?url=...&key=..."
+```
+Webhook
+  → Detect Caribbean (Code node; checks country against CARICOM list)
+  → IF country ∈ CARICOM?
+       TRUE  → Vercel /api/search → normalize → Respond
+       FALSE → original Apify pipeline → Respond
 ```
 
-Note: local dev uses a **different** Chromium (your local Chrome/Chromium path), not `@sparticuz/chromium`. If you hit launch errors locally, tweak `lib/scraper.ts` to use a local `executablePath` when `process.env.VERCEL` is unset. Not wired in by default.
+Inside the workflow, the HTTP node calling this endpoint needs two replacements:
+
+- `YOUR_VERCEL_DEPLOYMENT.vercel.app` → your actual Vercel URL (e.g. `jamaicanscraper.vercel.app`)
+- `YOUR_VERCEL_SHARED_SECRET` → the same secret you set in Vercel env vars
+
+## Limits & caveats
+
+1. **DDG result quality varies by country.** Jamaica, Trinidad, and Barbados index well. Smaller CARICOM members (Dominica, Saint Kitts, Montserrat) may return thin results — DDG only indexes what Google-like crawlers have reached.
+2. **No emails, no titles, no company data.** This endpoint returns URLs only. Email enrichment happens downstream in your existing n8n pipeline.
+3. **Rate limits.** DDG will soft-throttle if you hammer it (you'll see 200 OK but empty results). The function already sleeps 600 ms between pages. Don't call it more than a few times per minute.
+4. **Max 200 URLs per call.** DDG Lite stops returning fresh results past ~200. If you need more, split the query (different titles, etc.) and merge downstream.
+5. **URLs are deduped** (case-insensitive), with tracking params and trailing slashes stripped.
 
 ## Files
 
 ```
-api/scrape.ts          Vercel serverless handler
-lib/scraper.ts         Puppeteer scrape logic (port of src/index.ts from the zip)
-lib/utils.ts           Date / text / location helpers
-lib/errors.ts          SessionExpired custom error
-package.json           puppeteer-core + @sparticuz/chromium
-vercel.json            maxDuration: 60s, memory: 1024MB
+api/search.ts      DDG Lite scraper endpoint
+package.json       No runtime deps — uses built-in fetch
+vercel.json        30s timeout, 256MB memory
+.env.example       SCRAPER_SHARED_SECRET
 ```
+
+## Attribution
+
+This repo originally began as a port of [`josephlimtech/linkedin-profile-scraper-api`](https://github.com/josephlimtech/linkedin-profile-scraper-api) (MIT). That approach was scrapped because the upstream code does per-profile detail scraping, not search, which wasn't the job. The current code is purpose-built for query → URL discovery via DDG.

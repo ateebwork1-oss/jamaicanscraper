@@ -1,8 +1,8 @@
 {
   "functions": {
-    "api/scrape.ts": {
-      "memory": 1024,
-      "maxDuration": 60
+    "api/search.ts": {
+      "memory": 256,
+      "maxDuration": 30
     }
   }
 }

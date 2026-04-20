@@ -1,18 +1,13 @@
 {
-  "name": "linkedin-scraper-vercel",
+  "name": "jamaicanscraper",
   "version": "1.0.0",
   "private": true,
-  "description": "LinkedIn profile scraper deployed as a Vercel serverless function. Adapted from josephlimtech/linkedin-profile-scraper-api for @sparticuz/chromium + puppeteer-core.",
+  "description": "Caribbean LinkedIn URL discovery endpoint. Scrapes DuckDuckGo Lite for site:linkedin.com/in dorks. Deployed as a Vercel serverless function.",
   "scripts": {
     "dev": "vercel dev",
     "deploy": "vercel --prod"
   },
-  "dependencies": {
-    "@sparticuz/chromium": "^126.0.0",
-    "puppeteer-core": "^22.12.1",
-    "moment": "^2.30.1",
-    "moment-timezone": "^0.5.45"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/node": "^20.14.10",
     "@vercel/node": "^3.2.8",
