@@ -1,0 +1,21 @@
+{
+  "name": "linkedin-scraper-vercel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "LinkedIn profile scraper deployed as a Vercel serverless function. Adapted from josephlimtech/linkedin-profile-scraper-api for @sparticuz/chromium + puppeteer-core.",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "@sparticuz/chromium": "^126.0.0",
+    "puppeteer-core": "^22.12.1",
+    "moment": "^2.30.1",
+    "moment-timezone": "^0.5.45"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@vercel/node": "^3.2.8",
+    "typescript": "^5.5.3"
+  }
+}
