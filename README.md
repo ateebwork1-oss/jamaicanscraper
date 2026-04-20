@@ -1,15 +1,22 @@
 # Caribbean LinkedIn URL discovery (Vercel)
 
-Given a search query like `{ country: "Jamaica", title: "CEO" }`, this endpoint returns a list of public LinkedIn profile URLs by scraping DuckDuckGo Lite search results for the dork `site:linkedin.com/in/ "Jamaica" "CEO"`.
+Given a search query like `{ country: "Jamaica", title: "CEO" }`, this endpoint returns a list of public LinkedIn profile URLs.
 
 Designed as the **Caribbean-only branch** of an n8n workflow whose main Apify pipeline works everywhere else.
 
-**Why DDG and not SerpAPI / Google / LinkedIn search?**
+## Provider chain
 
-- Free, no API key, no billing
-- Doesn't CAPTCHA Vercel's datacenter IPs the way Google does
-- No LinkedIn cookie, so your `li_at` can never get burned
-- Cold starts < 1 s (no Puppeteer, no Chromium)
+The function tries these providers in order until one returns URLs:
+
+| # | Provider | Setup | Free quota | Works from Vercel? |
+|---|---|---|---|---|
+| 1 | **Serper.dev** (Google SERP API) | `SERPER_API_KEY` | 2,500 queries on signup, no CC | ✅ Reliable |
+| 2 | **Google Custom Search** | `GOOGLE_API_KEY` + `GOOGLE_CSE_ID` | 100/day, no CC | ✅ when configured right |
+| 3 | Bing HTML scrape | none | unlimited | ⚠️ Cloudflare CAPTCHA on datacenter IPs |
+| 4 | DuckDuckGo html | none | unlimited | ⚠️ Usually 403s from Vercel |
+| 5 | DuckDuckGo Lite | none | unlimited | ⚠️ Usually 403s from Vercel |
+
+**Recommended**: set `SERPER_API_KEY` and ignore the rest. The unkeyed scrapers mostly exist as a historical fallback and will almost always fail from a Vercel IP.
 
 ## Endpoint
 
@@ -22,7 +29,7 @@ Designed as the **Caribbean-only branch** of an n8n workflow whose main Apify pi
 | `industry` | string | one of | e.g. `Hospitality`, `Banking` |
 | `extraTerms` | string | one of | raw additional dork terms |
 | `limit` | number | no | default 50, max 200 |
-| `key` | string | **required** | must equal `SCRAPER_SHARED_SECRET` env var |
+| `key` | string | **required** | must equal `SCRAPER_SHARED_SECRET` env var (also accepted as `x-api-key` header) |
 
 At least one of `country / title / industry / extraTerms` is required.
 
@@ -33,12 +40,12 @@ At least one of `country / title / industry / extraTerms` is required.
   "ok": true,
   "query": "site:linkedin.com/in/ \"Jamaica\" \"CEO\"",
   "input": { "country": "Jamaica", "title": "CEO", "industry": "", "extraTerms": "", "limit": 50 },
+  "provider": "serper",
   "count": 34,
   "urls": [
-    { "url": "https://www.linkedin.com/in/jane-doe-abc123", "linkedin": "https://www.linkedin.com/in/jane-doe-abc123" },
-    { "url": "https://jm.linkedin.com/in/john-smith",       "linkedin": "https://jm.linkedin.com/in/john-smith" }
+    { "url": "https://www.linkedin.com/in/jane-doe-abc123", "linkedin": "https://www.linkedin.com/in/jane-doe-abc123" }
   ],
-  "debug": { "pages": [ { "page": 0, "offset": 0, "newUrls": 18 }, { "page": 1, "offset": 50, "newUrls": 16 } ] }
+  "debug": { "attempts": [ { "provider": "serper", "ok": true, "urls": [ "..." ] } ] }
 }
 ```
 
@@ -49,34 +56,35 @@ At least one of `country / title / industry / extraTerms` is required.
 | 400 | No search terms provided |
 | 401 | Bad or missing `key` / `x-api-key` |
 | 500 | `SCRAPER_SHARED_SECRET` not configured on Vercel |
-| 502 | DDG returned non-200 or failed mid-pagination (partial count in body) |
+| 502 | All providers failed — inspect `debug.attempts[]` for the reason |
 
 ## Deploy
 
-### 1. Vercel env vars
+### 1. Get a Serper API key (2 minutes, free)
 
-In your Vercel project settings → Environment Variables:
+1. Go to https://serper.dev and sign up with Google or email (no credit card).
+2. Dashboard → copy your API key.
 
-- `SCRAPER_SHARED_SECRET` = long random string (e.g. `openssl rand -hex 32`)
+### 2. Vercel env vars
 
-That's the only env var you need. No LinkedIn cookie, no API keys.
+In your Vercel project → Settings → Environment Variables (apply to **Production**):
 
-### 2. Deploy
+| Key | Value |
+|---|---|
+| `SCRAPER_SHARED_SECRET` | long random string, e.g. `openssl rand -hex 32` |
+| `SERPER_API_KEY` | the key from serper.dev |
 
-If you've already connected the GitHub repo to Vercel (which you have — `ateebwork1-oss/jamaicanscraper`), a `git push` to `main` auto-redeploys. Otherwise:
-
-```bash
-npm install
-vercel --prod
-```
+Then **Deployments → latest → Redeploy** (env var changes don't auto-redeploy).
 
 ### 3. Test
 
 ```bash
-curl "https://<your-vercel-url>/api/search?country=Jamaica&title=CEO&limit=20&key=YOUR_SHARED_SECRET"
+curl "https://jamaicanscraper.vercel.app/api/search?country=Jamaica&title=CEO&limit=20&key=YOUR_SHARED_SECRET"
 ```
 
-Expected: `ok: true` with a `urls` array of ~15–20 LinkedIn profile URLs.
+Expected: `ok: true`, `provider: "serper"`, and ~15–20 LinkedIn URLs.
+
+If you see `ok: false`, check `debug.attempts[0].error` — it will say exactly why Serper failed (bad key, quota exhausted, etc).
 
 ## Calling it from n8n
 
@@ -90,28 +98,24 @@ Webhook
        FALSE → original Apify pipeline → Respond
 ```
 
-Inside the workflow, the HTTP node calling this endpoint needs two replacements:
+Inside the workflow, the HTTP node calling this endpoint needs:
 
-- `YOUR_VERCEL_DEPLOYMENT.vercel.app` → your actual Vercel URL (e.g. `jamaicanscraper.vercel.app`)
-- `YOUR_VERCEL_SHARED_SECRET` → the same secret you set in Vercel env vars
+- URL: `https://jamaicanscraper.vercel.app/api/search` (already patched)
+- Header `x-api-key`: the `SCRAPER_SHARED_SECRET` value
 
 ## Limits & caveats
 
-1. **DDG result quality varies by country.** Jamaica, Trinidad, and Barbados index well. Smaller CARICOM members (Dominica, Saint Kitts, Montserrat) may return thin results — DDG only indexes what Google-like crawlers have reached.
-2. **No emails, no titles, no company data.** This endpoint returns URLs only. Email enrichment happens downstream in your existing n8n pipeline.
-3. **Rate limits.** DDG will soft-throttle if you hammer it (you'll see 200 OK but empty results). The function already sleeps 600 ms between pages. Don't call it more than a few times per minute.
-4. **Max 200 URLs per call.** DDG Lite stops returning fresh results past ~200. If you need more, split the query (different titles, etc.) and merge downstream.
-5. **URLs are deduped** (case-insensitive), with tracking params and trailing slashes stripped.
+1. **Serper free tier is 2,500 lifetime searches** on a new account. Each `limit` up to 100 = 1 search. Past 2,500, you need to pay or create a new account.
+2. **Google CSE alternative**: if you fix your Google Cloud project and wire up `GOOGLE_API_KEY` + `GOOGLE_CSE_ID`, it'll take over automatically when Serper is missing/empty (100/day, renewable daily, free forever).
+3. **No emails, no titles, no company data.** This endpoint returns URLs only. Email enrichment happens downstream in your existing n8n pipeline.
+4. **Max 200 URLs per call.** Split the query across titles/industries and merge downstream if you need more.
+5. **URLs are deduped** (case-insensitive), with query strings and trailing slashes stripped.
 
 ## Files
 
 ```
-api/search.ts      DDG Lite scraper endpoint
+api/search.ts      Multi-provider LinkedIn URL search endpoint
 package.json       No runtime deps — uses built-in fetch
 vercel.json        30s timeout, 256MB memory
-.env.example       SCRAPER_SHARED_SECRET
+.env.example       env var template
 ```
-
-## Attribution
-
-This repo originally began as a port of [`josephlimtech/linkedin-profile-scraper-api`](https://github.com/josephlimtech/linkedin-profile-scraper-api) (MIT). That approach was scrapped because the upstream code does per-profile detail scraping, not search, which wasn't the job. The current code is purpose-built for query → URL discovery via DDG.

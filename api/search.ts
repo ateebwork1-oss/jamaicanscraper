@@ -7,11 +7,13 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
  * Output: deduped list of LinkedIn profile URLs.
  *
  * Provider chain (first one that returns URLs wins):
- *   1. Google Custom Search API (needs GOOGLE_API_KEY + GOOGLE_CSE_ID)
- *      -> 100 queries/day free, no CC required, bulletproof from Vercel
- *   2. Bing HTML scrape (no key needed, usually works from datacenter IPs)
- *   3. DuckDuckGo html endpoint (often blocked from Vercel, worth trying)
- *   4. DuckDuckGo Lite endpoint (last resort)
+ *   1. Serper.dev Google SERP API (needs SERPER_API_KEY)
+ *      -> 2,500 free queries on signup, no CC, works instantly
+ *   2. Google Custom Search API (needs GOOGLE_API_KEY + GOOGLE_CSE_ID)
+ *      -> 100 queries/day free, no CC required
+ *   3. Bing HTML scrape (no key; often Cloudflare-CAPTCHA'd from datacenter IPs)
+ *   4. DuckDuckGo html endpoint (often 403 from Vercel)
+ *   5. DuckDuckGo Lite endpoint (last resort)
  *
  * Auth: header `x-api-key` OR query `?key=` must equal SCRAPER_SHARED_SECRET.
  */
@@ -168,7 +170,83 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ---------- Provider: Google Custom Search API (best if configured) ----------
+// ---------- Provider: Serper.dev (Google SERP API, top priority) ----------
+async function fetchSerper(
+  query: string,
+  limit: number,
+): Promise<ProviderResult> {
+  const apiKey = process.env.SERPER_API_KEY;
+  if (!apiKey) {
+    return {
+      provider: "serper",
+      ok: false,
+      urls: [],
+      error: "SERPER_API_KEY not set",
+    };
+  }
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  let lastStatus: number | undefined;
+
+  // Serper returns up to 100 results per call via `num`. Paginate with `page`.
+  const perPage = 100;
+  const pagesToFetch = Math.min(Math.ceil(limit / perPage), 3);
+
+  try {
+    for (let page = 1; page <= pagesToFetch; page++) {
+      const resp = await fetch("https://google.serper.dev/search", {
+        method: "POST",
+        headers: {
+          "X-API-KEY": apiKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ q: query, num: perPage, page, gl: "us" }),
+      });
+      lastStatus = resp.status;
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => "");
+        return {
+          provider: "serper",
+          httpStatus: resp.status,
+          ok: urls.length > 0,
+          urls,
+          error: `serper HTTP ${resp.status} ${errText.slice(0, 200)}`,
+        };
+      }
+      const data: any = await resp.json();
+      const organic: any[] = data?.organic || [];
+      if (organic.length === 0) break;
+      let newCount = 0;
+      for (const it of organic) {
+        const norm = normalizeUrl(String(it?.link || ""));
+        if (!norm) continue;
+        const key = norm.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        urls.push(norm);
+        newCount++;
+      }
+      if (newCount === 0) break;
+      if (urls.length >= limit) break;
+    }
+    return {
+      provider: "serper",
+      httpStatus: lastStatus,
+      ok: urls.length > 0,
+      urls,
+    };
+  } catch (err: any) {
+    return {
+      provider: "serper",
+      httpStatus: lastStatus,
+      ok: false,
+      urls,
+      error: err?.message || String(err),
+    };
+  }
+}
+
+// ---------- Provider: Google Custom Search API ----------
 async function fetchGoogleCSE(
   query: string,
   limit: number,
@@ -467,6 +545,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const attempts: ProviderResult[] = [];
 
   const providers: Array<() => Promise<ProviderResult>> = [
+    () => fetchSerper(query, input.limit),
     () => fetchGoogleCSE(query, input.limit),
     () => fetchBing(query, input.limit),
     () => fetchDDGHtml(query),
@@ -489,7 +568,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       query,
       input,
       error:
-        "All search providers failed. See debug.attempts[] for per-provider status. The most reliable free option is Google Custom Search API: create a CSE at https://programmablesearchengine.google.com, get an API key at https://console.cloud.google.com (enable 'Custom Search API'), then set GOOGLE_API_KEY and GOOGLE_CSE_ID env vars in Vercel.",
+        "All search providers failed. See debug.attempts[] for per-provider status. Quickest fix: sign up at https://serper.dev (free 2,500 queries, no credit card), paste the API key as SERPER_API_KEY in Vercel env vars, redeploy.",
       debug: { attempts },
     });
   }
